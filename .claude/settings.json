@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk -F'__' '{print $2}')",
+      "Bash(python talend_repoint.py \"D:\\\\Talend-Studio-20231027_1100-V8.0.1\\\\Talend-Studio-20231027_1100-V8.0.1\\\\workspace\\\\TALEND-KPI_CUSTOMER360-1765774989\\\\KPI_CUSTOMER360\\\\process\\\\Jobs\" --dry-run)",
+      "Bash(python quick_check_components.py test.item)"
+    ]
+  }
+}

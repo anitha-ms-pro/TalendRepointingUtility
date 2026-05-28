@@ -1,0 +1,5 @@
+# Additional dependencies for PDF report generation
+# Install with: pip install -r requirements_pdf.txt
+
+markdown>=3.4.0
+weasyprint>=60.0
