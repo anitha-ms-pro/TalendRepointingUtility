@@ -13,9 +13,10 @@ A Python CLI utility that processes Talend job folders and repoints **child jobs
 3. **Creates repointed copy** — New folder (original name) with GCP-repointed child jobs
 4. **Replaces components** — `tRedshiftConnection` → `tBigQueryConnection`, `tS3Connection` → `tGSConnection`, etc.
 5. **Converts SQL** — Redshift functions (GETDATE, dateadd, trunc, etc.) → BigQuery equivalents
-6. **Updates context variables** — AWS context vars → GCP equivalents
-7. **Renames labels** — `S3_Connection` → `GCS_Connection`, `RS_Connection` → `BQ_Connection`
-8. **Generates log report** — Detailed log with all changes and manual review flags
+6. **Updates context variables** — AWS context vars → GCP equivalents (supports Excel-based mappings)
+7. **Processes context files** — Updates `.item` context files when using Excel mappings
+8. **Renames labels** — `S3_Connection` → `GCS_Connection`, `RS_Connection` → `BQ_Connection`
+9. **Generates log report** — Detailed log with all changes and manual review flags
 
 ## Usage
 
@@ -32,6 +33,16 @@ python talend_repoint.py "D:\Talend-Studio-20231027_1100-V8.0.1\Talend-Studio-20
 ### Process Specific Folders Only
 ```bash
 python talend_repoint.py "D:\...\process\Jobs" --specific-folders CUST360_KIOSK CUST360_CCP_LOADS
+```
+
+### Use Excel File for Context Variable Mappings
+```bash
+python talend_repoint.py "D:\...\process\Jobs" --excel-context-file "D:\context-sheets\context_c360.xlsx"
+```
+
+### Combined: Specific Folders + Excel Mappings
+```bash
+python talend_repoint.py "D:\...\process\Jobs" --specific-folders CUST360_KIOSK --excel-context-file "D:\context-sheets\context_c360.xlsx"
 ```
 
 ## Component Replacement Map
@@ -100,6 +111,32 @@ Jobs/
 
 Detailed logs are saved in the `logs/` directory with timestamps:
 - `logs/repoint_20260523_150000.log`
+
+## Excel-Based Context Mappings
+
+Instead of hardcoding context variable mappings in `config.py`, you can use an Excel file with the following columns:
+
+| Column | Description |
+|--------|-------------|
+| `Context` | Original context name (e.g., `Redshift_CustDB_MKT`) |
+| `New_Context` | New context name (e.g., `BQ_CustDB_MKT`) |
+| `Variable_name` | Original variable name (e.g., `Redshift_CustDB_MKT_Dataset`) |
+| `New_Variable_Name` | New variable name (e.g., `BQ_CustDB_MKT_Dataset`) |
+| `No_Change_Context` | `TRUE` if context name stays the same |
+| `No_Change_Var_Name` | `TRUE` if variable name stays the same |
+
+**Example:**
+```
+Context              | New_Context       | Variable_name                    | New_Variable_Name              | No_Change_Context | No_Change_Var_Name
+---------------------|-------------------|----------------------------------|--------------------------------|-------------------|-------------------
+Redshift_CustDB_MKT  | BQ_CustDB_MKT     | Redshift_CustDB_MKT_Dataset      | BQ_CustDB_MKT_Dataset          | FALSE             | FALSE
+Redshift_CustDB_MKT  | BQ_CustDB_MKT     | Redshift_CustDB_MKT_Project      | BQ_CustDB_MKT_Project          | FALSE             | FALSE
+```
+
+The utility will:
+- Replace context names in job files
+- Replace variable names in context files (`.item` files in the `context/` directory)
+- Add BigQuery project prefixes to dataset references automatically
 
 ## Customization
 
