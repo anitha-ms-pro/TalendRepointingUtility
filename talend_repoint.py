@@ -1,5 +1,5 @@
 """
-Talend AWS → GCP Repointing Utility
+Talend AWS to GCP Repointing Utility
 =====================================
 Main script to process Talend job folders and repoint child jobs from
 AWS (Redshift/S3) to GCP (BigQuery/GCS).
@@ -36,6 +36,9 @@ from config import (
     LABEL_REPLACEMENTS,
     NEW_GCP_CONTEXT_PARAMS,
     USE_BQ_BATCH_API,
+    USE_EXCEL_MAPPINGS,
+    CONTEXT_RENAMES,
+    VARIABLE_RENAMES,
 )
 from sql_converter import (
     convert_redshift_to_bigquery,
@@ -1031,8 +1034,50 @@ def replace_context_variables(content: str, logger: logging.Logger) -> str:
         return full_tag
 
     result = context_param_pattern.sub(rename_job_level_context, result)
-    
+
     return result
+
+
+def inject_project_prefix_for_excel_contexts(sql_text: str) -> str:
+    """
+    Add project prefix to BigQuery dataset references for Excel-based context variables.
+
+    Transforms:
+        FROM "+context.BQ_CustDB_MKT_Dataset+".tablename
+    To:
+        FROM "+context.BQ_CustDB_MKT_Project+"."+context.BQ_CustDB_MKT_Dataset+".tablename
+
+    Works with both raw quotes (") and XML-encoded quotes (&quot;)
+    """
+    # Pattern to match: "+context.BQ_XXX_Dataset+" or &quot;+context.BQ_XXX_Dataset+&quot;
+    # Capture the context base name (e.g., BQ_CustDB_MKT) and the quote style
+
+    # Handle raw quotes first
+    pattern_raw = r'"(\+\s*context\.(BQ_[A-Za-z0-9_]+)_Dataset(_Stage)?\s*\+\s*)"'
+
+    def add_project_prefix_raw(match):
+        context_base = match.group(2)  # e.g., BQ_CustDB_MKT
+        stage_suffix = match.group(3) if match.group(3) else ''  # _Stage or empty
+
+        # Build the replacement with project prefix
+        return f'"+context.{context_base}_Project+"."+context.{context_base}_Dataset{stage_suffix}+"'
+
+    sql_text = re.sub(pattern_raw, add_project_prefix_raw, sql_text)
+
+    # Handle XML-encoded quotes
+    pattern_xml = r'(&quot;\+\s*context\.(BQ_[A-Za-z0-9_]+)_Dataset(_Stage)?\s*\+\s*&quot;)'
+
+    def add_project_prefix_xml(match):
+        full_match = match.group(0)
+        context_base = match.group(2)  # e.g., BQ_CustDB_MKT
+        stage_suffix = match.group(3) if match.group(3) else ''  # _Stage or empty
+
+        # Build the replacement with project prefix
+        return f'&quot;+context.{context_base}_Project+&quot;.&quot;+context.{context_base}_Dataset{stage_suffix}+&quot;'
+
+    sql_text = re.sub(pattern_xml, add_project_prefix_xml, sql_text)
+
+    return sql_text
 
 
 def convert_sql_in_content(content: str, logger: logging.Logger, job_name: str = None, translated_queries: dict = None, name_map: dict = None) -> tuple:
@@ -1649,7 +1694,11 @@ def process_item_file(item_path: str, logger: logging.Logger, dry_run: bool = Fa
     
     # 6. Replace context variables throughout (including the newly inserted SQL queries)
     content = replace_context_variables(content, logger)
-    
+
+    # 6b. Add project prefix to BQ dataset references (must run AFTER variable replacement)
+    content = inject_project_prefix_for_excel_contexts(content)
+    logger.debug("  Added project prefix to BigQuery dataset references")
+
     # 7. Replace generic AWS references
     content = replace_generic_aws_references(content, logger)
     
@@ -1740,13 +1789,13 @@ def process_job_folder(folder_path: str, logger: logging.Logger, dry_run: bool =
 def main():
     """Main entry point for the Talend Repointing Utility."""
     parser = argparse.ArgumentParser(
-        description='Talend AWS → GCP Repointing Utility',
+        description='Talend AWS to GCP Repointing Utility',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python talend_repoint.py "D:\\path\\to\\Jobs"
   python talend_repoint.py "D:\\path\\to\\Jobs" --dry-run
-  python talend_repoint.py "D:\\path\\to\\Jobs" --specific-folders CUST360_KIOSK CUST360_CCP_LOADS
+  python talend_repoint.py "D:\\path\\to\\Jobs" --excel-context-file "D:\\context-sheets\\context_c360.xlsx"
+  python talend_repoint.py "D:\\path\\to\\Jobs" --specific-folders CUST360_KIOSK --excel-context-file "D:\\context.xlsx"
         """
     )
     
@@ -1766,9 +1815,21 @@ Examples:
         nargs='+',
         help='Only process specific job group folders (space-separated names)'
     )
-    
+
+    parser.add_argument(
+        '--excel-context-file',
+        type=str,
+        help='Path to Excel file containing context variable mappings (e.g., D:\\context-sheets\\context_c360.xlsx)'
+    )
+
     args = parser.parse_args()
-    
+
+    # Reload Excel mappings if custom path provided
+    if args.excel_context_file:
+        import config
+        config.reload_excel_mappings(args.excel_context_file)
+        print(f"[INFO] Reloaded Excel mappings from: {args.excel_context_file}")
+
     # Setup
     script_dir = os.path.dirname(os.path.abspath(__file__))
     log_dir = os.path.join(script_dir, 'logs')
@@ -1900,6 +1961,68 @@ Examples:
     # Track SQL conversion statistics
     total_queries_sent_to_api = len(queries_to_translate) if USE_BQ_BATCH_API and queries_to_translate else 0
     total_api_success = len(translated_queries)
+
+    # =========================================================================
+    # STEP 4: PROCESS CONTEXT FILES (if using Excel mappings)
+    # =========================================================================
+    if USE_EXCEL_MAPPINGS and (CONTEXT_RENAMES or VARIABLE_RENAMES):
+        logger.info("\n" + "=" * 70)
+        logger.info("  STEP 4: PROCESSING CONTEXT FILES (Excel-based)")
+        logger.info("=" * 70)
+
+        # Import context file processor
+        from context_file_processor import process_context_files
+        from context_usage_analyzer import find_contexts_used_by_jobs, filter_context_renames, filter_variable_renames
+
+        # Find context directory
+        # Structure: workspace/PROJECT/process/Jobs (input)
+        # Context is at: workspace/PROJECT/context
+        # Remove \\?\ prefix if present for proper path manipulation
+        clean_jobs_folder = jobs_folder.replace('\\\\?\\', '')
+
+        # Find the "process" directory in the path and go back from there
+        path_parts = clean_jobs_folder.split(os.sep)
+        if 'process' in path_parts:
+            process_index = path_parts.index('process')
+            # Rebuild path up to (but not including) "process"
+            project_dir = os.sep.join(path_parts[:process_index])
+            context_dir = os.path.join(project_dir, 'context')
+        else:
+            # Fallback: assume Jobs is directly under process
+            process_dir = os.path.dirname(clean_jobs_folder)
+            project_dir = os.path.dirname(process_dir)
+            context_dir = os.path.join(project_dir, 'context')
+
+        if os.path.exists(context_dir):
+            # If specific folders are specified, only process contexts used by those folders
+            contexts_to_process = CONTEXT_RENAMES
+            variables_to_process = VARIABLE_RENAMES
+
+            if args.specific_folders:
+                logger.info(f"\n  Analyzing context usage for specific folders: {args.specific_folders}")
+
+                # Find which contexts are actually used by the specific folders
+                contexts_used = find_contexts_used_by_jobs(all_folders, logger)
+
+                # Filter the renames to only include used contexts
+                contexts_to_process = filter_context_renames(CONTEXT_RENAMES, contexts_used)
+                variables_to_process = filter_variable_renames(VARIABLE_RENAMES, contexts_used)
+
+                logger.info(f"\n  Filtered to {len(contexts_to_process)} context renames")
+                logger.info(f"  Filtered to {len(variables_to_process)} variable renames")
+            else:
+                logger.info(f"\n  Processing ALL contexts in repository")
+
+            context_stats = process_context_files(
+                context_dir=context_dir,
+                context_renames=contexts_to_process,
+                variable_renames=variables_to_process,
+                logger=logger,
+                dry_run=args.dry_run
+            )
+        else:
+            logger.warning(f"  Context directory not found: {context_dir}")
+            logger.warning(f"  Skipping context file processing")
 
     # Process each folder
     all_results = []

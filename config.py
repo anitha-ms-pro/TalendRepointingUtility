@@ -3,13 +3,89 @@ Configuration for Talend AWS → GCP Repointing Utility
 All mapping tables for components, context variables, SQL functions, and labels.
 """
 
+import pandas as pd
+import os
+
+# =============================================================================
+# EXCEL-BASED CONTEXT VARIABLE MAPPINGS
+# =============================================================================
+EXCEL_CONTEXT_FILE = r"D:\context-sheets\context_c360.xlsx"  # Default path
+USE_EXCEL_MAPPINGS = True  # Set to False to use hardcoded mappings only
+
+def load_excel_context_mappings(excel_file_path=None):
+    """
+    Load context variable mappings from Excel file.
+
+    Args:
+        excel_file_path: Optional path to Excel file. If not provided, uses EXCEL_CONTEXT_FILE.
+
+    Returns:
+        Tuple of (context_renames, variable_renames, context_variable_map)
+    """
+    excel_path = excel_file_path if excel_file_path else EXCEL_CONTEXT_FILE
+
+    if not USE_EXCEL_MAPPINGS or not os.path.exists(excel_path):
+        return {}, {}, {}
+
+    try:
+        df = pd.read_excel(excel_path)
+        print(f"[INFO] Loading context mappings from: {excel_path}")
+
+        context_renames = {}
+        variable_renames = {}
+        context_variable_map = {}
+
+        for _, row in df.iterrows():
+            old_context = str(row['Context'])
+            new_context = str(row['New_Context'])
+            old_var = str(row['Variable_name'])
+            new_var = str(row['New_Variable_Name'])
+            no_change_ctx = row['No_Change_Context']
+            no_change_var = row['No_Change_Var_Name']
+
+            # Track context renames
+            if not no_change_ctx and old_context != new_context:
+                context_renames[old_context] = new_context
+
+            # Track variable renames
+            if not no_change_var and old_var != new_var:
+                variable_renames[old_var] = new_var
+                context_variable_map[f"context.{old_var}"] = f"context.{new_var}"
+
+        print(f"[OK] Loaded {len(context_renames)} context renames from Excel")
+        print(f"[OK] Loaded {len(variable_renames)} variable renames from Excel")
+        print(f"[OK] Loaded {len(context_variable_map)} context.variable mappings from Excel")
+
+        return context_renames, variable_renames, context_variable_map
+    except Exception as e:
+        print(f"[WARN] Error loading Excel: {e}")
+        return {}, {}, {}
+
+# Load mappings on import (will be reloaded in main() if --excel-context-file is provided)
+CONTEXT_RENAMES, VARIABLE_RENAMES, EXCEL_CONTEXT_VARIABLE_MAP = load_excel_context_mappings()
+
+def reload_excel_mappings(excel_file_path):
+    """
+    Reload Excel mappings from a different file path.
+    Call this from main() after parsing command-line arguments.
+    """
+    global CONTEXT_RENAMES, VARIABLE_RENAMES, EXCEL_CONTEXT_VARIABLE_MAP, CONTEXT_VARIABLE_REPLACEMENTS, CONTEXT_PARAM_NAME_REPLACEMENTS
+
+    CONTEXT_RENAMES, VARIABLE_RENAMES, EXCEL_CONTEXT_VARIABLE_MAP = load_excel_context_mappings(excel_file_path)
+
+    # Update the replacement dictionaries
+    if USE_EXCEL_MAPPINGS and EXCEL_CONTEXT_VARIABLE_MAP:
+        CONTEXT_VARIABLE_REPLACEMENTS = EXCEL_CONTEXT_VARIABLE_MAP
+    if USE_EXCEL_MAPPINGS and VARIABLE_RENAMES:
+        CONTEXT_PARAM_NAME_REPLACEMENTS = VARIABLE_RENAMES
+
 # =============================================================================
 # COMPONENT NAME REPLACEMENTS
 # Maps AWS Talend component names to their GCP equivalents.
 # Value of None means the component should be REMOVED entirely.
 # =============================================================================
 COMPONENT_REPLACEMENTS = {
-    # S3 → GCS
+    # S3 → GCS (standard components)
     "tS3Connection":        "tGSConnection",
     "tS3Configuration":     "tGSConfiguration",
     "tS3Put":               "tGSPut",
@@ -18,6 +94,15 @@ COMPONENT_REPLACEMENTS = {
     "tS3List":              "tGSList",
     "tS3Delete":            "tGSDelete",
     "tS3Close":             "tGSClose",
+
+    # S3 → GCS (Joblet/custom components without 't' prefix)
+    "S3Put":                "tGSPut",
+    "S3Get":                "tGSGet",
+    "S3Copy":               "tGSCopy",
+    "S3List":               "tGSList",
+    "S3Delete":             "tGSDelete",
+    "S3Close":              "tGSClose",
+    "S3Connection":         "tGSConnection",
 
     # Redshift → BigQuery
     "tRedshiftConnection":  None,  # REMOVE - BQ is stateless
@@ -66,6 +151,7 @@ COMPONENTS_TO_REMOVE = {k for k, v in COMPONENT_REPLACEMENTS.items() if v is Non
 # e.g. tS3Connection_1 → tGSConnection_1
 # =============================================================================
 UNIQUE_NAME_PREFIX_REPLACEMENTS = {
+    # Standard tS3* components
     "tS3Connection":        "tGSConnection",
     "tS3Configuration":     "tGSConfiguration",
     "tS3Put":               "tGSPut",
@@ -74,6 +160,15 @@ UNIQUE_NAME_PREFIX_REPLACEMENTS = {
     "tS3List":              "tGSList",
     "tS3Delete":            "tGSDelete",
     "tS3Close":             "tGSClose",
+
+    # Joblet/custom S3* components (without 't' prefix)
+    "S3Put":                "tGSPut",
+    "S3Get":                "tGSGet",
+    "S3Copy":               "tGSCopy",
+    "S3List":               "tGSList",
+    "S3Delete":             "tGSDelete",
+    "S3Close":              "tGSClose",
+    "S3Connection":         "tGSConnection",
     "tRedshiftConnection":  "tBigQueryConnection",
     "tRedshiftInput":       "tBigQueryInput",
     "tRedshiftOutput":      "tBigQueryOutput",
@@ -99,10 +194,12 @@ UNIQUE_NAME_PREFIX_REPLACEMENTS = {
 }
 
 # =============================================================================
-# CONTEXT VARIABLE REPLACEMENTS
+# CONTEXT VARIABLE REPLACEMENTS (COMMENTED OUT - NOW USING EXCEL)
 # Replaces AWS context references in .item XML content.
 # Both as context parameter names and as inline references.
+# NOTE: This is now loaded from Excel file. Keeping for reference only.
 # =============================================================================
+"""
 CONTEXT_VARIABLE_REPLACEMENTS = {
     # S3 path contexts → GCS
     "context.s3inputpath":                          "context.gcsinputpath",
@@ -155,10 +252,20 @@ CONTEXT_VARIABLE_REPLACEMENTS = {
     "context.aws_region":                            "context.gcp_region",
     "context.AWS_Param_Store_Region":                "context.gcp_region",
 }
+"""
 
+# Use Excel mappings if available, otherwise fall back to hardcoded (for backward compatibility)
+if USE_EXCEL_MAPPINGS and EXCEL_CONTEXT_VARIABLE_MAP:
+    CONTEXT_VARIABLE_REPLACEMENTS = EXCEL_CONTEXT_VARIABLE_MAP
+else:
+    # Fallback to hardcoded mappings (uncomment the above if Excel not available)
+    CONTEXT_VARIABLE_REPLACEMENTS = {}
+
+"""
 # Context parameter NAME replacements (for the name="" attribute in contextParameter)
 # NOTE: Redshift/AWS/S3 prefixed variables are now handled by pattern-based conversion
 # Pattern applies automatically: Redshift_* -> BQ_*, AWS_* -> GCP_*, S3_* -> GCS_* (CASE PRESERVED)
+# NOTE: This is now loaded from Excel file. Keeping for reference only.
 CONTEXT_PARAM_NAME_REPLACEMENTS = {
     "s3inputpath":                          "gcsinputpath",
     "s3lookuppath":                         "gcslookuppath",
@@ -181,6 +288,13 @@ CONTEXT_PARAM_NAME_REPLACEMENTS = {
     "aws_region":                           "gcp_region",
     "AWS_Param_Store_Region":               "gcp_region",
 }
+"""
+
+# Use Excel mappings if available
+if USE_EXCEL_MAPPINGS and VARIABLE_RENAMES:
+    CONTEXT_PARAM_NAME_REPLACEMENTS = VARIABLE_RENAMES
+else:
+    CONTEXT_PARAM_NAME_REPLACEMENTS = {}
 
 # =============================================================================
 # LABEL REPLACEMENTS
