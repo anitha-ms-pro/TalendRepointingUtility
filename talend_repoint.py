@@ -1541,25 +1541,57 @@ def update_component_parameters(content: str, logger: logging.Logger) -> str:
         return node_start + node_content + node_end
     result = gsconn_pattern.sub(update_gsconn, result)
     
-    # 4. tGSPut: Map FILE -> LOCALDIR, KEY -> REMOTEDIR (with stripped filename)
+    # 4. tGSPut: Map configuration.bucket -> BUCKET, configuration.file -> LOCALDIR, configuration.key -> REMOTEDIR
     gsput_pattern = re.compile(r'(<node\s+componentName="tGSPut"[^>]*>)(.*?)(</node>)', re.DOTALL)
     def update_gsput(match):
         node_start = match.group(1)
         node_content = match.group(2)
         node_end = match.group(3)
+
+        # Handle both old S3 format (FILE/KEY) and new GCS format (configuration.bucket/configuration.file/configuration.key)
+        # Check for configuration.bucket (from tS3Put migration)
+        config_bucket_match = re.search(r'<elementParameter\s+field="TEXT"\s+name="configuration\.bucket"\s+value="([^"]+)"\s*/>', node_content)
+        if config_bucket_match:
+            bucket_val = config_bucket_match.group(1)
+            node_content = node_content.replace(config_bucket_match.group(0), '')
+            if 'name="BUCKET"' not in node_content:
+                node_content += f'\n    <elementParameter field="TEXT" name="BUCKET" value="{bucket_val}"/>'
+                logger.debug(f"  Converted configuration.bucket -> BUCKET in tGSPut")
+
+        # Check for configuration.file
+        config_file_match = re.search(r'<elementParameter\s+field="FILE"\s+name="configuration\.file"\s+value="([^"]+)"\s*/>', node_content)
+        if config_file_match:
+            file_val = config_file_match.group(1)
+            node_content = node_content.replace(config_file_match.group(0), '')
+            if 'name="LOCALDIR"' not in node_content:
+                node_content += f'\n    <elementParameter field="DIRECTORY" name="LOCALDIR" value="{file_val}"/>'
+                logger.debug(f"  Converted configuration.file -> LOCALDIR in tGSPut")
+
+        # Check for configuration.key
+        config_key_match = re.search(r'<elementParameter\s+field="TEXT"\s+name="configuration\.key"\s+value="([^"]+)"\s*/>', node_content)
+        if config_key_match:
+            key_val = config_key_match.group(1)
+            node_content = node_content.replace(config_key_match.group(0), '')
+            dir_val = extract_gcs_dir(key_val)
+            if 'name="REMOTEDIR"' not in node_content:
+                node_content += f'\n    <elementParameter field="TEXT" name="REMOTEDIR" value="{dir_val}"/>'
+                logger.debug(f"  Converted configuration.key -> REMOTEDIR in tGSPut")
+
+        # Also handle legacy FILE/KEY format (if not using configuration.* format)
         file_match = re.search(r'<elementParameter\s+field="[^"]+"\s+name="FILE"\s+value="([^"]+)"\s*/>', node_content)
         key_match = re.search(r'<elementParameter\s+field="[^"]+"\s+name="KEY"\s+value="([^"]+)"\s*/>', node_content)
-        if file_match:
+        if file_match and not config_file_match:
             file_val = file_match.group(1)
             node_content = node_content.replace(file_match.group(0), '')
             if 'name="LOCALDIR"' not in node_content:
                 node_content += f'\n    <elementParameter field="DIRECTORY" name="LOCALDIR" value="{file_val}"/>'
-        if key_match:
+        if key_match and not config_key_match:
             key_val = key_match.group(1)
             node_content = node_content.replace(key_match.group(0), '')
             dir_val = extract_gcs_dir(key_val)
             if 'name="REMOTEDIR"' not in node_content:
                 node_content += f'\n    <elementParameter field="TEXT" name="REMOTEDIR" value="{dir_val}"/>'
+
         return node_start + node_content + node_end
     result = gsput_pattern.sub(update_gsput, result)
     
