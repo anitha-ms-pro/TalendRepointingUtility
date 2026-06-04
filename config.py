@@ -7,6 +7,13 @@ import pandas as pd
 import os
 
 # =============================================================================
+# TABLE NAME CASE CONVERSION SETTING
+# =============================================================================
+# Set to True to UPPERCASE table names in SQL (Redshift lowercase → BigQuery UPPERCASE)
+# Set to False to lowercase table names (default behavior)
+UPPERCASE_TABLE_NAMES = False
+
+# =============================================================================
 # EXCEL-BASED CONTEXT VARIABLE MAPPINGS
 # =============================================================================
 EXCEL_CONTEXT_FILE = r"D:\context-sheets\context_c360.xlsx"  # Default path
@@ -119,6 +126,13 @@ COMPONENT_REPLACEMENTS = {
     "tSnowflakeRow":        "tBigQuerySQLRow",
     "tSnowflakeClose":      None,  # REMOVE
 
+    # Snowflake → BigQuery (Custom/Joblet components WITHOUT 't' prefix)
+    "SnowflakeConnection":  None,  # REMOVE
+    "SnowflakeInput":       "tBigQueryInput",
+    "SnowflakeOutput":      "tBigQueryOutput",
+    "SnowflakeRow":         "tBigQuerySQLRow",
+    "SnowflakeClose":       None,  # REMOVE
+
     # MSSQL → BigQuery
     "tMSSqlConnection":     None,  # REMOVE
     "tMSSqlInput":          "tBigQueryInput",
@@ -178,6 +192,11 @@ UNIQUE_NAME_PREFIX_REPLACEMENTS = {
     "tSnowflakeInput":      "tBigQueryInput",
     "tSnowflakeOutput":     "tBigQueryOutput",
     "tSnowflakeRow":        "tBigQuerySQLRow",
+    # Snowflake custom components (without 't' prefix)
+    "SnowflakeConnection":  "tBigQueryConnection",
+    "SnowflakeInput":       "tBigQueryInput",
+    "SnowflakeOutput":      "tBigQueryOutput",
+    "SnowflakeRow":         "tBigQuerySQLRow",
     "tMSSqlConnection":     "tBigQueryConnection",
     "tMSSqlInput":          "tBigQueryInput",
     "tMSSqlOutput":         "tBigQueryOutput",
@@ -354,14 +373,18 @@ SKIP_PATTERNS = ["GrandMaster", "Master", "ABAC", "Grandmaster", "grandmaster", 
 # We use case-insensitive matching in the actual code
 
 # =============================================================================
-# GCP BIGQUERY SQL BATCH TRANSLATION API CONFIGURATION
+# GCP BIGQUERY SQL TRANSLATION API CONFIGURATION
 # =============================================================================
-USE_BQ_BATCH_API = True  # Set to True to enable GCS-based Batch Translation API
-GCS_BUCKET_NAME = "dmgcp-del-155-raw"  # GCS Bucket for temp translation files
-GCS_INPUT_PREFIX = "talend-repointing/input"    # GCS folder for uploading Redshift queries
-GCS_OUTPUT_PREFIX = "talend-repointing/output"  # GCS folder for downloading BigQuery queries
+# Real-time Translation API (for individual queries during migration)
+USE_BQ_TRANSLATION_API = True  # Set to True to enable real-time SQL Translation API
 GCP_TRANSLATION_PROJECT_ID = "dmgcp-del-155"  # GCP Project to charge for translation API calls
 GCP_TRANSLATION_LOCATION = "us"  # GCP Location for the translation service
+
+# Batch Translation API (for bulk translation via GCS)
+USE_BQ_BATCH_API = True  # Set to True to enable GCS-based Batch Translation API
+GCS_BUCKET_NAME = "dmgcp-del-155-raw"  # GCS Bucket for temp translation files
+GCS_INPUT_PREFIX = "talend-repointing/input"    # GCS folder for uploading source queries
+GCS_OUTPUT_PREFIX = "talend-repointing/output"  # GCS folder for downloading BigQuery queries
 
 # =============================================================================
 # SQL CONVERSION CONFIGURATION
@@ -369,6 +392,63 @@ GCP_TRANSLATION_LOCATION = "us"  # GCP Location for the translation service
 INJECT_GCP_PROJECT_IN_SCHEMAS = False  # Set to True to inject context.gcp_src_project/gcp_tgt_project before schema names
                                        # True: "+context.gcp_src_project+"."+context.bq_custdb_mkt_schema+"
                                        # False: "+context.bq_custdb_mkt_schema+"
+
+# =============================================================================
+# COMPONENT TO SQL DIALECT MAPPING (for BigQuery Translation API)
+# =============================================================================
+# Maps Talend component names to BigQuery SQL Translation API dialect strings
+# Reference: https://cloud.google.com/bigquery/docs/interactive-sql-translator
+COMPONENT_TO_SQL_DIALECT = {
+    # Redshift (Generally Available)
+    "tRedshiftInput": "REDSHIFT",
+    "tRedshiftOutput": "REDSHIFT",
+    "tRedshiftRow": "REDSHIFT",
+
+    # Snowflake (Preview)
+    "tSnowflakeInput": "SNOWFLAKE",
+    "tSnowflakeOutput": "SNOWFLAKE",
+    "tSnowflakeRow": "SNOWFLAKE",
+
+    # Snowflake custom components (without 't' prefix) - Preview
+    "SnowflakeInput": "SNOWFLAKE",
+    "SnowflakeOutput": "SNOWFLAKE",
+    "SnowflakeRow": "SNOWFLAKE",
+
+    # SQL Server / MSSQL (Preview)
+    "tMSSqlInput": "SQL_SERVER",
+    "tMSSqlOutput": "SQL_SERVER",
+    "tMSSqlRow": "SQL_SERVER",
+
+    # Oracle (Preview - SQL & PL/SQL)
+    "tOracleInput": "ORACLE",
+    "tOracleOutput": "ORACLE",
+    "tOracleRow": "ORACLE",
+
+    # Teradata (Generally Available)
+    "tTeradataInput": "TERADATA",
+    "tTeradataOutput": "TERADATA",
+    "tTeradataRow": "TERADATA",
+
+    # MySQL (Preview)
+    "tMysqlInput": "MYSQL",
+    "tMysqlOutput": "MYSQL",
+    "tMysqlRow": "MYSQL",
+
+    # PostgreSQL (Preview)
+    "tPostgresqlInput": "POSTGRESQL",
+    "tPostgresqlOutput": "POSTGRESQL",
+    "tPostgresqlRow": "POSTGRESQL",
+
+    # Generic tDB components (default to REDSHIFT for backwards compatibility)
+    "tDBInput": "REDSHIFT",
+    "tDBOutput": "REDSHIFT",
+    "tDBRow": "REDSHIFT",
+
+    # BigQuery components (already in BigQuery format, no translation needed)
+    "tBigQueryInput": None,
+    "tBigQueryOutput": None,
+    "tBigQuerySQLRow": None,
+}
 
 # =============================================================================
 # REPORT GENERATION CONFIGURATION

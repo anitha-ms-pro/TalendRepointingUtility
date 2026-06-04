@@ -185,42 +185,56 @@ _api_import_warning_shown = False
 _api_disabled = False
 
 
-def _translate_via_gcp_api(sql_text: str) -> str:
-    """Translates SQL using BQ SQL Translation API if enabled, otherwise returns None."""
+def _translate_via_gcp_api(sql_text: str, source_dialect: str = "REDSHIFT") -> str:
+    """
+    Translates SQL using BQ SQL Translation API if enabled, otherwise returns None.
+
+    Args:
+        sql_text: The SQL text to translate
+        source_dialect: Source SQL dialect (REDSHIFT, SNOWFLAKE, SQL_SERVER, ORACLE, TERADATA, etc.)
+                       See COMPONENT_TO_SQL_DIALECT in config.py for supported dialects.
+
+    Returns:
+        Translated SQL string, or None if translation fails or is disabled
+    """
     global _api_warning_shown, _api_import_warning_shown, _api_disabled
-    
+
     # If the API has already failed once, bypass immediately to avoid timeout delays
     if _api_disabled:
         return None
-        
+
+    # Skip translation if source_dialect is None (e.g., already BigQuery components)
+    if source_dialect is None:
+        return None
+
     try:
         from config import USE_BQ_TRANSLATION_API, GCP_TRANSLATION_PROJECT_ID, GCP_TRANSLATION_LOCATION
         if not USE_BQ_TRANSLATION_API or not GCP_TRANSLATION_PROJECT_ID:
             _api_disabled = True
             return None
-            
+
         # Import dynamically to avoid crash if dependency is missing (v2alpha contains SqlTranslationServiceClient)
         from google.cloud.bigquery_migration_v2alpha import SqlTranslationServiceClient
-        
+
         res = _tokenize_talend_sql(sql_text)
         tokenized_sql = res[0]
         p_map = res[1]
-        
+
         client = SqlTranslationServiceClient()
         parent = f"projects/{GCP_TRANSLATION_PROJECT_ID}/locations/{GCP_TRANSLATION_LOCATION}"
-        
+
         request = {
             "parent": parent,
-            "source_dialect": "REDSHIFT",
+            "source_dialect": source_dialect,
             "query": tokenized_sql,
         }
-        
+
         response = client.translate_query(request=request)
         translated_query = response.translated_query
-        
+
         if not translated_query:
             return None
-            
+
         return _detokenize_talend_sql(translated_query, *res[1:])
         
     except ImportError:
@@ -240,7 +254,9 @@ def _translate_via_gcp_api(sql_text: str) -> str:
 
 
 def lowercase_table_expression(expr: str) -> str:
-    """Split table name expression by Java concatenations and lowercase only SQL literal parts."""
+    """Split table name expression by Java concatenations and convert SQL literal parts based on config."""
+    from config import UPPERCASE_TABLE_NAMES
+
     # First check if there's a table alias at the end (1-5 uppercase letters followed by space or end)
     alias_pattern = re.compile(r'\s+([A-Z]{1,5})$')
     alias_match = alias_pattern.search(expr)
@@ -255,7 +271,7 @@ def lowercase_table_expression(expr: str) -> str:
     pattern = re.compile(r'((?:&quot;|"|\')\s*\+\s*.*?\s*\+\s*(?:&quot;|"|\'))', re.DOTALL)
     parts = pattern.split(expr_without_alias)
 
-    lowered_parts = []
+    converted_parts = []
     for part in parts:
         part_stripped = part.strip()
         # Check if this is a Java expression (quoted string with + inside)
@@ -266,18 +282,25 @@ def lowercase_table_expression(expr: str) -> str:
         ) and '+' in part_stripped
 
         if is_java:
-            # Keep Java expressions as-is (don't lowercase context variables)
-            lowered_parts.append(part)
+            # Keep Java expressions as-is (don't change context variables)
+            converted_parts.append(part)
         else:
-            # Lowercase SQL literal parts (table names, etc.)
-            lowered_parts.append(part.lower())
+            # Convert SQL literal parts (table names, etc.) based on config
+            if UPPERCASE_TABLE_NAMES:
+                # Uppercase but preserve XML entities (&#xD; &#xA; etc)
+                uppercased = part.upper()
+                # Fix XML entities back to lowercase 'x' (&#XD; -> &#xD;)
+                uppercased = uppercased.replace('&#XD;', '&#xD;').replace('&#XA;', '&#xA;')
+                converted_parts.append(uppercased)
+            else:
+                converted_parts.append(part.lower())
 
     # Add back the alias (keep it uppercase for readability)
-    return "".join(lowered_parts) + alias
+    return "".join(converted_parts) + alias
 
 
 def lowercase_table_names_in_sql(sql: str) -> str:
-    """Find and lowercase all table names referenced in SQL statements."""
+    """Find and convert all table names referenced in SQL statements (uppercase or lowercase based on config)."""
     keywords = [
         r'\bFROM', r'\bJOIN', r'\bINTO', r'\bUPDATE', r'\bDELETE\s+FROM',
         r'\bDELETE', r'\bUSING', r'\bTABLE(?:\s+IF\s+NOT\s+EXISTS|\s+IF\s+EXISTS)?',
@@ -297,21 +320,23 @@ def lowercase_table_names_in_sql(sql: str) -> str:
         def replace_table(match):
             keyword = match.group(1)
             table_expr = match.group(2).strip()
-            lowered_expr = lowercase_table_expression(table_expr)
-            return f"{keyword} {lowered_expr}"
+            converted_expr = lowercase_table_expression(table_expr)  # Note: function name kept for backwards compat
+            return f"{keyword} {converted_expr}"
 
         result = pattern.sub(replace_table, result)
 
     return result
 
 
-def convert_redshift_to_bigquery(sql_text: str) -> str:
+def convert_redshift_to_bigquery(sql_text: str, source_dialect: str = "REDSHIFT") -> str:
     """
-    Convert Redshift SQL to BigQuery SQL.
+    Convert source database SQL to BigQuery SQL.
     The input may contain XML-encoded entities since it comes from Talend .item files.
 
     Args:
         sql_text: Raw SQL string (may contain XML entities like &quot; &#13; &#10;)
+        source_dialect: Source SQL dialect (REDSHIFT, SNOWFLAKE, SQL_SERVER, ORACLE, TERADATA, etc.)
+                       Defaults to REDSHIFT for backwards compatibility.
 
     Returns:
         Converted BigQuery-compatible SQL string
@@ -320,7 +345,7 @@ def convert_redshift_to_bigquery(sql_text: str) -> str:
         return sql_text
 
     # Try BQ SQL Translation API first (if enabled and set up)
-    api_result = _translate_via_gcp_api(sql_text)
+    api_result = _translate_via_gcp_api(sql_text, source_dialect=source_dialect)
     if api_result is not None:
         # Schema injection and post-processing should still be run on the API output
         result = _inject_gcp_project_in_schemas(api_result)
@@ -448,7 +473,7 @@ def convert_redshift_to_bigquery(sql_text: str) -> str:
     result = re.sub(r'\\&quot;(&quot;\s*\+\s*context\.gcp_[a-z_]+_project)', r'\1', result)
     result = re.sub(r'(context\.gcp_bq_[a-z_]+_dataset\s*\+\s*&quot;)\\&quot;', r'\1', result)
 
-    # Lowercase table names in the final query to handle BigQuery case sensitivity
+    # Convert table names in the final query (uppercase or lowercase based on config.UPPERCASE_TABLE_NAMES)
     result = lowercase_table_names_in_sql(result)
 
     return result

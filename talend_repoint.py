@@ -167,6 +167,7 @@ def extract_queries_from_item(item_path: str, logger: logging.Logger) -> dict:
         sql_components = {
             'tRedshiftRow', 'tRedshiftInput', 'tRedshiftUnload',
             'tSnowflakeRow', 'tSnowflakeInput',
+            'SnowflakeRow', 'SnowflakeInput',  # Custom/Joblet Snowflake components
             'tMSSqlRow', 'tMSSqlInput', 'tMSSqlSCD',
             'tOracleRow', 'tOracleInput',
             'tDBRow', 'tDBInput',
@@ -180,9 +181,14 @@ def extract_queries_from_item(item_path: str, logger: logging.Logger) -> dict:
         if not uname_match:
             continue
         uname = uname_match.group(1)
-        
-        # Extract QUERY value
+
+        # Extract QUERY value (try both field names for different component types)
+        # Standard components use name="QUERY"
+        # Snowflake components use name="configuration.sqlQuery"
         query_match = re.search(r'name="QUERY"[^>]*value="([^"]*?)"', node_content, re.DOTALL)
+        if not query_match:
+            # Try Snowflake-style configuration.sqlQuery
+            query_match = re.search(r'name="configuration\.sqlQuery"[^>]*value="([^"]*?)"', node_content, re.DOTALL)
         if query_match:
             query_val = query_match.group(1)
             # Only store if it's not empty/whitespace
@@ -1105,16 +1111,30 @@ def convert_sql_in_content(content: str, logger: logging.Logger, job_name: str =
         node_start = match.group(1)
         node_content = match.group(2)
         node_end = match.group(3)
-        
-        # Check if it has a QUERY parameter
-        query_pattern = re.compile(r'(name="QUERY"\s+value=")([^"]*?)(")', re.DOTALL)
-        query_match = query_pattern.search(node_content)
-        
+
+        # Extract componentName from node tag to determine SQL dialect
+        component_name_match = re.search(r'componentName="([^"]+)"', node_start)
+        component_name = component_name_match.group(1) if component_name_match else None
+
+        # Map component name to SQL dialect for API translation
+        from config import COMPONENT_TO_SQL_DIALECT
+        source_dialect = COMPONENT_TO_SQL_DIALECT.get(component_name, "REDSHIFT") if component_name else "REDSHIFT"
+
+        # Check if it has a QUERY parameter (standard components or Snowflake components)
+        # Try standard QUERY field first
+        query_pattern_standard = re.compile(r'(name="QUERY"\s+value=")([^"]*?)(")', re.DOTALL)
+        query_match = query_pattern_standard.search(node_content)
+
+        # If not found, try Snowflake-style configuration.sqlQuery field
+        if not query_match:
+            query_pattern_snowflake = re.compile(r'(name="configuration\.sqlQuery"\s+value=")([^"]*?)(")', re.DOTALL)
+            query_match = query_pattern_snowflake.search(node_content)
+
         if query_match:
             prefix = query_match.group(1)
             sql_content = query_match.group(2)
             suffix = query_match.group(3)
-            
+
             # Extract UNIQUE_NAME of this component
             uname_match = re.search(r'name="UNIQUE_NAME"[^>]*value="([^"]+)"', node_content)
             uname = uname_match.group(1) if uname_match else None
@@ -1191,13 +1211,14 @@ def convert_sql_in_content(content: str, logger: logging.Logger, job_name: str =
                 node_content = node_content.replace(query_match.group(0), new_query_param)
                 api_count += 1  # Track API translation
             else:
-                # Fallback to local rules
-                converted = convert_redshift_to_bigquery(sql_content)
+                # Fallback to local rules with dialect-specific conversion
+                converted = convert_redshift_to_bigquery(sql_content, source_dialect=source_dialect)
                 if converted != sql_content:
                     new_query_param = prefix + converted + suffix
                     node_content = node_content.replace(query_match.group(0), new_query_param)
                     local_count += 1  # Track local conversion
-                    logger.debug(f"  Converted SQL query locally for component {uname if uname else 'unknown'}")
+                    dialect_info = f" ({source_dialect})" if source_dialect != "REDSHIFT" else ""
+                    logger.debug(f"  Converted SQL query locally for component {uname if uname else 'unknown'}{dialect_info}")
                     
         return node_start + node_content + node_end
         
@@ -1421,16 +1442,59 @@ def update_component_parameters(content: str, logger: logging.Logger) -> str:
         result = gcs_comp_pattern.sub(update_gcs_node_connection, result)
         logger.debug(f"  Forced GCS components to use connection: {gs_conn_name}")
     
-    # 1. tGSList: Enable "List objects in bucket list"
+    # 1. tGSList: Enable "List objects in bucket list" AND convert S3 TABLE format to GCS TABLE format
     gslist_pattern = re.compile(r'(<node\s+componentName="tGSList"[^>]*>)(.*?)(</node>)', re.DOTALL)
     def update_gslist(match):
         node_start = match.group(1)
         node_content = match.group(2)
         node_end = match.group(3)
+
+        # Enable LIST_IN_BUCKET_LIST
         if 'name="LIST_IN_BUCKET_LIST"' not in node_content:
             new_param = '\n    <elementParameter field="CHECK" name="LIST_IN_BUCKET_LIST" value="true"/>'
             node_content += new_param
             logger.debug("  Added LIST_IN_BUCKET_LIST=true to tGSList")
+
+        # Convert S3 bucket TABLE format to GCS bucket TABLE format
+        # S3 format: configuration.buckets[].bucketName / configuration.buckets[].keyPrefix (can be multiple pairs)
+        # GCS format: BUCKET_NAME / OBJECT_PREFIX / OBJECT_DELIMITER (with id attributes)
+        s3_table_pattern = re.compile(
+            r'<elementParameter\s+field="TABLE"\s+name="configuration\.buckets">(.*?)</elementParameter>',
+            re.DOTALL
+        )
+
+        s3_table_match = s3_table_pattern.search(node_content)
+        if s3_table_match and 'configuration.buckets[].bucketName' in s3_table_match.group(1):
+            # Extract all bucket/key pairs
+            table_content = s3_table_match.group(1)
+
+            # Find all bucketName entries
+            bucket_pattern = re.compile(
+                r'<elementValue\s+elementRef="configuration\.buckets\[\]\.bucketName"\s+value="([^"]+)"\s*/>'
+            )
+            buckets = bucket_pattern.findall(table_content)
+
+            # Find all keyPrefix entries
+            prefix_pattern = re.compile(
+                r'<elementValue\s+elementRef="configuration\.buckets\[\]\.keyPrefix"\s+value="([^"]+)"\s*/>'
+            )
+            prefixes = prefix_pattern.findall(table_content)
+
+            # Build new GCS format with multiple entries
+            if buckets and prefixes and len(buckets) == len(prefixes):
+                gcs_entries = []
+                for idx, (bucket, prefix) in enumerate(zip(buckets, prefixes)):
+                    # Each bucket gets 3 rows: BUCKET_NAME, OBJECT_PREFIX, OBJECT_DELIMITER
+                    base_id = idx * 3
+                    gcs_entries.append(f'      <elementValue elementRef="BUCKET_NAME" value="{bucket}" id="{base_id}"/>')
+                    gcs_entries.append(f'      <elementValue elementRef="OBJECT_PREFIX" value="{prefix}" id="{base_id + 1}"/>')
+                    gcs_entries.append(f'      <elementValue elementRef="OBJECT_DELIMITER" value="&quot;&quot;" id="{base_id + 2}"/>')
+
+                gcs_table = '<elementParameter field="TABLE" name="BUCKETS">\n' + '\n'.join(gcs_entries) + '\n    </elementParameter>'
+
+                node_content = node_content.replace(s3_table_match.group(0), gcs_table)
+                logger.debug(f"  Converted S3 bucket TABLE to GCS format in tGSList ({len(buckets)} bucket entries)")
+
         return node_start + node_content + node_end
     result = gslist_pattern.sub(update_gslist, result)
     
@@ -1630,6 +1694,111 @@ def update_component_parameters(content: str, logger: logging.Logger) -> str:
     return result
 
 
+def clean_aws_remnants_from_gcp_components(content: str, logger: logging.Logger) -> str:
+    """
+    Remove AWS-specific attributes from GCP components that were migrated from AWS.
+
+    Fixes:
+    1. ALL GCS components: Remove AWS access keys (tGSConnection, tGSPut, tGSList, etc.)
+    2. tGSConnection: Set proper GCP credential provider
+    3. tBigQueryInput/tBigQuerySQLRow: Change redshift_id mapping to bigquery_id
+    4. tBigQueryInput/tBigQuerySQLRow: Change redshift-jdbc.log to bigquery-jdbc.log
+    """
+    result = content
+
+    # Fix 1: Clean AWS credentials from ALL GCS components
+    # Pattern matches tGSConnection, tGSPut, tGSGet, tGSList, tGSDelete, tGSCopy, tGSClose
+    gcs_all_pattern = re.compile(
+        r'(<node\s+componentName="(tGS[^"]+)"[^>]*>)(.*?)(</node>)',
+        re.DOTALL
+    )
+
+    def clean_gcs_component(match):
+        node_start = match.group(1)
+        comp_name = match.group(2)
+        node_content = match.group(3)
+        node_end = match.group(4)
+
+        # Remove AWS-specific credential parameters (accessKey, secretKey)
+        # These appear in ALL GCS components but are not used when USE_EXISTING_CONNECTION=true
+        # Pattern handles both formats:
+        # - tGSConnection: configuration.staticCredentialConfiguration.accessKey
+        # - Other GCS: configuration.dataset.datastore.staticCredentialConfiguration.accessKey
+        patterns_to_remove = [
+            r'\s*<elementParameter\s+field="TEXT"\s+name="configuration\.(?:dataset\.datastore\.)?staticCredentialConfiguration\.accessKey"[^>]*/>',
+            r'\s*<elementParameter\s+field="PASSWORD"\s+name="configuration\.(?:dataset\.datastore\.)?staticCredentialConfiguration\.secretKey"[^>]*/>',
+        ]
+
+        cleaned = False
+        for pattern in patterns_to_remove:
+            if re.search(pattern, node_content):
+                node_content = re.sub(pattern, '', node_content)
+                cleaned = True
+
+        # For tGSConnection specifically, ensure credentialProvider is set to INHERIT_CREDENTIALS
+        if comp_name == "tGSConnection":
+            cred_provider_match = re.search(
+                r'<elementParameter\s+field="CLOSED_LIST"\s+name="configuration\.credentialProvider"\s+value="([^"]+)"',
+                node_content
+            )
+
+            if cred_provider_match:
+                # Replace with INHERIT_CREDENTIALS
+                old_param = cred_provider_match.group(0)
+                new_param = old_param.replace(
+                    f'value="{cred_provider_match.group(1)}"',
+                    'value="INHERIT_CREDENTIALS"'
+                )
+                node_content = node_content.replace(old_param, new_param)
+                logger.debug("  Cleaned AWS credentials from tGSConnection and set INHERIT_CREDENTIALS")
+        elif cleaned:
+            logger.debug(f"  Removed AWS credentials from {comp_name}")
+
+        return node_start + node_content + node_end
+
+    result = gcs_all_pattern.sub(clean_gcs_component, result)
+
+    # Fix 2 & 3: Clean BigQuery components (tBigQueryInput, tBigQuerySQLRow)
+    bq_pattern = re.compile(
+        r'(<node\s+componentName="(tBigQueryInput|tBigQuerySQLRow)"[^>]*>)(.*?)(</node>)',
+        re.DOTALL
+    )
+
+    def clean_bigquery_component(match):
+        node_start = match.group(1)
+        comp_name = match.group(2)
+        node_content = match.group(3)
+        node_end = match.group(4)
+
+        # Fix 2: Change redshift_id mapping to bigquery_id
+        mapping_match = re.search(
+            r'(<elementParameter\s+field="MAPPING_TYPE"\s+name="MAPPING"\s+value=")redshift_id(")',
+            node_content
+        )
+        if mapping_match:
+            old_param = mapping_match.group(0)
+            new_param = mapping_match.group(1) + 'bigquery_id' + mapping_match.group(2)
+            node_content = node_content.replace(old_param, new_param)
+            logger.debug(f"  Changed mapping from redshift_id to bigquery_id in {comp_name}")
+
+        # Fix 3: Change redshift-jdbc.log to bigquery-jdbc.log
+        log_file_match = re.search(
+            r'(<elementParameter\s+field="FILE"\s+name="LOG_FILE"\s+value="[^"]*?)redshift-jdbc\.log([^"]*?")',
+            node_content
+        )
+        if log_file_match:
+            old_param = log_file_match.group(0)
+            new_param = log_file_match.group(1) + 'bigquery-jdbc.log' + log_file_match.group(2)
+            node_content = node_content.replace(old_param, new_param)
+            logger.debug(f"  Changed log file from redshift-jdbc.log to bigquery-jdbc.log in {comp_name}")
+
+        return node_start + node_content + node_end
+
+    result = bq_pattern.sub(clean_bigquery_component, result)
+
+    return result
+
+
 def process_item_file(item_path: str, logger: logging.Logger, dry_run: bool = False, translated_queries: dict = None) -> dict:
     """
     Process a single Talend .item file: apply all repointing transformations.
@@ -1672,7 +1841,10 @@ def process_item_file(item_path: str, logger: logging.Logger, dry_run: bool = Fa
     
     # NEW: Update specific parameters for GCP components
     content = update_component_parameters(content, logger)
-    
+
+    # NEW: Clean AWS remnants from GCP components (credentials, mappings, log paths)
+    content = clean_aws_remnants_from_gcp_components(content, logger)
+
     # Count component replacements
     for old_comp, new_comp in COMPONENT_REPLACEMENTS.items():
         if new_comp is not None and f'componentName="{new_comp}"' in content:
@@ -1701,11 +1873,16 @@ def process_item_file(item_path: str, logger: logging.Logger, dry_run: bool = Fa
 
     # 7. Replace generic AWS references
     content = replace_generic_aws_references(content, logger)
-    
-    # 7. Inject new GCP context parameters
+
+    # 7b. Fix uppercase XML entities (&#XD; &#XA;) to lowercase (&#xD; &#xA;)
+    # Uppercase entities cause XML parse errors in Talend Studio
+    content = content.replace('&#XD;', '&#xD;').replace('&#XA;', '&#xA;')
+    logger.debug("  Normalized XML entities to lowercase")
+
+    # 7c. Inject new GCP context parameters
     # The user specifically requested not to add new contexts or rename job-level contexts
     # content = inject_new_gcp_context_params(content, logger)
-    
+
     # 8. Check for manual review flags in SQL content
     sql_sections = re.findall(r'name="QUERY"\s+value="([^"]*?)"', content, re.DOTALL)
     for sql in sql_sections:

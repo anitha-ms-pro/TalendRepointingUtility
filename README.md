@@ -47,8 +47,9 @@ python talend_repoint.py "D:\...\process\Jobs" --specific-folders CUST360_KIOSK 
 
 ## Component Replacement Map
 
-| AWS Component | GCP Replacement |
+| AWS/Database Component | GCP Replacement |
 |---|---|
+| **S3 → GCS** | |
 | tS3Connection | tGSConnection |
 | tS3Configuration | tGSConfiguration |
 | tS3Put | tGSPut |
@@ -57,40 +58,72 @@ python talend_repoint.py "D:\...\process\Jobs" --specific-folders CUST360_KIOSK 
 | tS3List | tGSList |
 | tS3Delete | tGSDelete |
 | tS3Close | tGSClose |
+| **Redshift → BigQuery** | |
 | tRedshiftConnection | tBigQueryConnection |
 | tRedshiftInput | tBigQueryInput |
 | tRedshiftOutput | tBigQueryOutput |
 | tRedshiftRow | tBigQuerySQLRow |
 | tRedshiftUnload | tBigQueryInput |
 | tRedshiftClose | *REMOVED* |
+| **Snowflake → BigQuery (Standard)** | |
 | tSnowflakeConnection | tBigQueryConnection |
 | tSnowflakeInput | tBigQueryInput |
 | tSnowflakeOutput | tBigQueryOutput |
 | tSnowflakeRow | tBigQuerySQLRow |
 | tSnowflakeClose | *REMOVED* |
+| **Snowflake → BigQuery (Custom/Joblet)** | |
+| SnowflakeConnection | *REMOVED* |
+| SnowflakeInput | tBigQueryInput |
+| SnowflakeOutput | tBigQueryOutput |
+| SnowflakeRow | tBigQuerySQLRow |
+| SnowflakeClose | *REMOVED* |
+| **MSSQL → BigQuery** | |
 | tMSSqlConnection | tBigQueryConnection |
 | tMSSqlInput | tBigQueryInput |
 | tMSSqlOutput | tBigQueryOutput |
 | tMSSqlRow | tBigQuerySQLRow |
 | tMSSqlClose | *REMOVED* |
+| **Oracle → BigQuery** | |
 | tOracleConnection | tBigQueryConnection |
 | tOracleInput | tBigQueryInput |
 | tOracleOutput | tBigQueryOutput |
 | tOracleRow | tBigQuerySQLRow |
 | tOracleClose | *REMOVED* |
 
-## SQL Conversion Examples
+## SQL Conversion
 
-| Redshift | BigQuery |
+The utility uses **GCP BigQuery Translation API** to convert SQL queries from various dialects (Redshift, Snowflake, SQL Server, Oracle, Teradata) to BigQuery syntax. If API translation fails, it falls back to local regex-based conversion rules.
+
+### Supported SQL Dialects
+- Redshift (Generally Available)
+- Snowflake (Generally Available)
+- SQL Server (Preview)
+- Oracle (Preview)
+- Teradata (Preview)
+
+### SQL Conversion Examples
+
+| Source SQL | BigQuery |
 |---|---|
+| **Redshift Functions** | |
 | `GETDATE()` | `CURRENT_TIMESTAMP()` |
 | `dateadd(day, -7, CURRENT_DATE)` | `DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)` |
 | `trunc(column)` | `DATE(column)` |
 | `NVL(a, b)` | `IFNULL(a, b)` |
 | `ISNULL(a, b)` | `IFNULL(a, b)` |
 | `LEN(str)` | `LENGTH(str)` |
+| **Snowflake Functions** | |
+| `DATE_PART('HOUR', timestamp_col)` | `EXTRACT(HOUR FROM timestamp_col)` |
+| `EXTRACT(DOW FROM date_col)` | `EXTRACT(DAYOFWEEK FROM date_col)` |
+| `to_char(date_col, 'YYYYMMDD')` | `FORMAT_DATE('%Y%m%d', date_col)` |
+| `DATEADD(day, -7, CURRENT_DATE)` | `DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)` |
+| **Common Conversions** | |
 | `s3://bucket` | `gs://bucket` |
 | `CREATE TEMP TABLE t (LIKE schema.tbl)` | `CREATE TEMP TABLE t AS SELECT * FROM schema.tbl WHERE 1=0` |
+
+### Known Limitations
+- **Snowflake COPY INTO** commands cannot be auto-converted (requires manual job redesign)
+- Complex proprietary SQL may require manual review after migration
 
 ## Folder Structure After Repointing
 
