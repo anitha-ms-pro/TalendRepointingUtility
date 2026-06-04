@@ -1498,20 +1498,40 @@ def update_component_parameters(content: str, logger: logging.Logger) -> str:
         return node_start + node_content + node_end
     result = gslist_pattern.sub(update_gslist, result)
     
-    # 2. tGSDelete: Convert BUCKET and KEY to BUCKETS table
+    # 2. tGSDelete: Convert BUCKET/KEY or configuration.bucket/configuration.key to BUCKETS table
     gsdelete_pattern = re.compile(r'(<node\s+componentName="tGSDelete"[^>]*>)(.*?)(</node>)', re.DOTALL)
     def update_gsdelete(match):
         node_start = match.group(1)
         node_content = match.group(2)
         node_end = match.group(3)
-        bucket_match = re.search(r'<elementParameter\s+field="TEXT"\s+name="BUCKET"\s+value="([^"]+)"\s*/>', node_content)
-        key_match = re.search(r'<elementParameter\s+field="TEXT"\s+name="KEY"\s+value="([^"]+)"\s*/>', node_content)
-        
-        if bucket_match and key_match:
-            bucket_val = bucket_match.group(1)
-            key_val = key_match.group(1)
-            node_content = node_content.replace(bucket_match.group(0), '')
-            node_content = node_content.replace(key_match.group(0), '')
+
+        # Check for configuration.bucket and configuration.key (from S3Delete custom component)
+        config_bucket_match = re.search(r'<elementParameter\s+field="TEXT"\s+name="configuration\.bucket"\s+value="([^"]+)"\s*/>', node_content)
+        config_key_match = re.search(r'<elementParameter\s+field="TEXT"\s+name="configuration\.key"\s+value="([^"]+)"\s*/>', node_content)
+
+        bucket_val = None
+        key_val = None
+
+        if config_bucket_match and config_key_match:
+            # Custom S3Delete component format
+            bucket_val = config_bucket_match.group(1)
+            key_val = config_key_match.group(1)
+            node_content = node_content.replace(config_bucket_match.group(0), '')
+            node_content = node_content.replace(config_key_match.group(0), '')
+            logger.debug("  Converted configuration.bucket/configuration.key in tGSDelete")
+        else:
+            # Standard format (BUCKET and KEY)
+            bucket_match = re.search(r'<elementParameter\s+field="TEXT"\s+name="BUCKET"\s+value="([^"]+)"\s*/>', node_content)
+            key_match = re.search(r'<elementParameter\s+field="TEXT"\s+name="KEY"\s+value="([^"]+)"\s*/>', node_content)
+
+            if bucket_match and key_match:
+                bucket_val = bucket_match.group(1)
+                key_val = key_match.group(1)
+                node_content = node_content.replace(bucket_match.group(0), '')
+                node_content = node_content.replace(key_match.group(0), '')
+
+        # Add BUCKETS table if we have bucket and key values
+        if bucket_val and key_val:
             if 'name="DEL_IN_LIST_BUCKETS"' not in node_content:
                 new_params = f'''
     <elementParameter field="CHECK" name="DEL_IN_LIST_BUCKETS" value="true"/>
@@ -1522,6 +1542,7 @@ def update_component_parameters(content: str, logger: logging.Logger) -> str:
     </elementParameter>'''
                 node_content += new_params
                 logger.debug("  Updated tGSDelete parameters (DEL_IN_LIST_BUCKETS and BUCKETS table)")
+
         return node_start + node_content + node_end
     result = gsdelete_pattern.sub(update_gsdelete, result)
     
@@ -1687,39 +1708,65 @@ def update_component_parameters(content: str, logger: logging.Logger) -> str:
         return node_start + node_content + node_end
     result = bq_pattern.sub(update_bq, result)
 
-    # 7. tGSCopy: Map parameters from S3Copy mapping
+    # 7. tGSCopy: Map parameters from S3Copy mapping (both standard and configuration.* formats)
     gscopy_pattern = re.compile(r'(<node\s+componentName="tGSCopy"[^>]*>)(.*?)(</node>)', re.DOTALL)
     def update_gscopy(match):
         node_start = match.group(1)
         node_content = match.group(2)
         node_end = match.group(3)
-        
-        from_bucket_m = re.search(r'<elementParameter\s+field="[^"]+"\s+name="FROM_BUCKET"\s+value="([^"]+)"\s*/>', node_content)
-        from_key_m = re.search(r'<elementParameter\s+field="[^"]+"\s+name="FROM_KEY"\s+value="([^"]+)"\s*/>', node_content)
-        to_bucket_m = re.search(r'<elementParameter\s+field="[^"]+"\s+name="TO_BUCKET"\s+value="([^"]+)"\s*/>', node_content)
-        to_key_m = re.search(r'<elementParameter\s+field="[^"]+"\s+name="TO_KEY"\s+value="([^"]+)"\s*/>', node_content)
-        
-        if from_bucket_m:
-            val = from_bucket_m.group(1)
-            node_content = node_content.replace(from_bucket_m.group(0), '')
-            if 'name="SOURCE_BUCKET"' not in node_content:
-                node_content += f'\n    <elementParameter field="TEXT" name="SOURCE_BUCKET" value="{val}"/>'
-        if from_key_m:
-            val = from_key_m.group(1)
-            node_content = node_content.replace(from_key_m.group(0), '')
-            if 'name="SOURCE_OBJECTKEY"' not in node_content:
-                node_content += f'\n    <elementParameter field="TEXT" name="SOURCE_OBJECTKEY" value="{val}"/>'
-        if to_bucket_m:
-            val = to_bucket_m.group(1)
-            node_content = node_content.replace(to_bucket_m.group(0), '')
-            if 'name="TARGET_BUCKET"' not in node_content:
-                node_content += f'\n    <elementParameter field="TEXT" name="TARGET_BUCKET" value="{val}"/>'
-        if to_key_m:
-            val = to_key_m.group(1)
-            node_content = node_content.replace(to_key_m.group(0), '')
-            if 'name="TARGET_FOLDER"' not in node_content:
-                node_content += f'\n    <elementParameter field="TEXT" name="TARGET_FOLDER" value="{val}"/>'
-                
+
+        # Check for configuration.* format (from S3Copy custom component)
+        config_bucket_m = re.search(r'<elementParameter\s+field="TEXT"\s+name="configuration\.bucket"\s+value="([^"]+)"\s*/>', node_content)
+        config_source_key_m = re.search(r'<elementParameter\s+field="TEXT"\s+name="configuration\.sourceKey"\s+value="([^"]+)"\s*/>', node_content)
+        config_dest_bucket_m = re.search(r'<elementParameter\s+field="TEXT"\s+name="configuration\.destinationBucket"\s+value="([^"]+)"\s*/>', node_content)
+        config_dest_key_m = re.search(r'<elementParameter\s+field="TEXT"\s+name="configuration\.destinationKey"\s+value="([^"]+)"\s*/>', node_content)
+
+        source_bucket_val = None
+        source_key_val = None
+        target_bucket_val = None
+        target_key_val = None
+
+        # Handle configuration.* format
+        if config_bucket_m and config_source_key_m and config_dest_bucket_m and config_dest_key_m:
+            source_bucket_val = config_bucket_m.group(1)
+            source_key_val = config_source_key_m.group(1)
+            target_bucket_val = config_dest_bucket_m.group(1)
+            target_key_val = config_dest_key_m.group(1)
+            node_content = node_content.replace(config_bucket_m.group(0), '')
+            node_content = node_content.replace(config_source_key_m.group(0), '')
+            node_content = node_content.replace(config_dest_bucket_m.group(0), '')
+            node_content = node_content.replace(config_dest_key_m.group(0), '')
+            logger.debug("  Converted configuration.* parameters in tGSCopy")
+        else:
+            # Handle standard FROM_BUCKET/FROM_KEY/TO_BUCKET/TO_KEY format
+            from_bucket_m = re.search(r'<elementParameter\s+field="[^"]+"\s+name="FROM_BUCKET"\s+value="([^"]+)"\s*/>', node_content)
+            from_key_m = re.search(r'<elementParameter\s+field="[^"]+"\s+name="FROM_KEY"\s+value="([^"]+)"\s*/>', node_content)
+            to_bucket_m = re.search(r'<elementParameter\s+field="[^"]+"\s+name="TO_BUCKET"\s+value="([^"]+)"\s*/>', node_content)
+            to_key_m = re.search(r'<elementParameter\s+field="[^"]+"\s+name="TO_KEY"\s+value="([^"]+)"\s*/>', node_content)
+
+            if from_bucket_m:
+                source_bucket_val = from_bucket_m.group(1)
+                node_content = node_content.replace(from_bucket_m.group(0), '')
+            if from_key_m:
+                source_key_val = from_key_m.group(1)
+                node_content = node_content.replace(from_key_m.group(0), '')
+            if to_bucket_m:
+                target_bucket_val = to_bucket_m.group(1)
+                node_content = node_content.replace(to_bucket_m.group(0), '')
+            if to_key_m:
+                target_key_val = to_key_m.group(1)
+                node_content = node_content.replace(to_key_m.group(0), '')
+
+        # Add new GCS format parameters
+        if source_bucket_val and 'name="SOURCE_BUCKET"' not in node_content:
+            node_content += f'\n    <elementParameter field="TEXT" name="SOURCE_BUCKET" value="{source_bucket_val}"/>'
+        if source_key_val and 'name="SOURCE_OBJECTKEY"' not in node_content:
+            node_content += f'\n    <elementParameter field="TEXT" name="SOURCE_OBJECTKEY" value="{source_key_val}"/>'
+        if target_bucket_val and 'name="TARGET_BUCKET"' not in node_content:
+            node_content += f'\n    <elementParameter field="TEXT" name="TARGET_BUCKET" value="{target_bucket_val}"/>'
+        if target_key_val and 'name="TARGET_FOLDER"' not in node_content:
+            node_content += f'\n    <elementParameter field="TEXT" name="TARGET_FOLDER" value="{target_key_val}"/>'
+
         return node_start + node_content + node_end
     result = gscopy_pattern.sub(update_gscopy, result)
 
